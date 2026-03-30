@@ -91,7 +91,8 @@ def write_posts(ss, posts):
         rows = [[
             p['date'].strftime('%Y-%m-%d %H:%M:%S'),
             p['chat_name'],
-            p['author'],
+            p['author_name'],
+            p['author_link'],
             p['link'],
             p['text']
         ] for p in posts]
@@ -114,10 +115,12 @@ def send_to_telegram(posts, tg_token, tg_chats):
     if not posts or not tg_token or not tg_chats:
         return
     for p in posts:
-        author = p.get('author', '')
         parts = ['📢 ' + p['chat_name']]
-        if author:
-            parts.append('👤 ' + author)
+        if p.get('author_name'):
+            author_str = p['author_name']
+            if p.get('author_link'):
+                author_str += ' — ' + p['author_link']
+            parts.append('👤 ' + author_str)
         parts.append('')
         parts.append(p['text'])
         parts.append('')
@@ -163,41 +166,61 @@ def build_link(chat, msg_id):
         chat_id = chat_id[4:]
     return 'https://t.me/c/' + chat_id + '/' + str(msg_id)
 
-def get_author(msg):
+def get_author_info(msg):
+    """Возвращает (имя_фамилия, ссылка_на_аккаунт)."""
     try:
         if not msg.sender:
-            return ''
+            return '', ''
         sender = msg.sender
         first = getattr(sender, 'first_name', '') or ''
         last = getattr(sender, 'last_name', '') or ''
         username = getattr(sender, 'username', '') or ''
         full_name = (first + ' ' + last).strip()
-        if username:
-            return (full_name + ' (@' + username + ')').strip() if full_name else '@' + username
-        return full_name or str(getattr(sender, 'id', ''))
+        author_link = ('https://t.me/' + username) if username else ''
+        return full_name, author_link
     except Exception:
-        return ''
+        return '', ''
 
 def matches_keywords(text, keywords):
+    """
+    Проверяет текст на соответствие ключевым словам.
+    Поддерживает поиск по корню слова автоматически.
+    Звёздочка в конце (купи*) — явный поиск по корню.
+    Без звёздочки — ищем точное слово И однокоренные формы.
+    """
     if not text or not keywords:
         return False
     text_lower = text.lower()
+
     for kw in keywords:
         kw_lower = kw.lower().strip()
         if not kw_lower:
             continue
+
+        # Режим явного корня: тест* → тест, тестируем, тестовый, тестирование...
         if kw_lower.endswith('*'):
-            if kw_lower[:-1] in text_lower:
+            root = kw_lower[:-1]
+            # Ищем корень как начало слова
+            if re.search(r'\b' + re.escape(root), text_lower):
                 return True
             continue
+
+        # Точное совпадение
         escaped = re.escape(kw_lower)
         if re.search(r'\b' + escaped + r'\b', text_lower):
             return True
-        if len(kw_lower) > 4:
-            root = escaped[:-2]
-            suffixes = r'(ть|л|ла|ли|ло|ет|ешь|ем|ете|ут|ют|ит|ишь|им|ите|ат|ят|у|ю|а|я|е|и|ой|ей|ого|его|ому|ему|ом|ем|ых|их|ов|ами|ями)?'
-            if re.search(r'\b' + root + suffixes + r'\b', text_lower):
+
+        # Автоматический поиск однокоренных форм:
+        # Постепенно укорачиваем слово отрезая окончания (минимум 4 буквы в корне)
+        # тест → тест (корень) → найдёт тестируем, тестовый, тестирование
+        # привет → привет (корень) → найдёт приветствую, приветливый
+        for cut in range(1, min(4, len(kw_lower) - 3)):
+            root = kw_lower[:-cut]
+            if len(root) < 4:
+                break
+            if re.search(r'\b' + re.escape(root), text_lower):
                 return True
+
     return False
 
 async def main():
@@ -260,27 +283,36 @@ async def main():
             new_last_link = last_link
 
             for msg in messages:
+                # Пропускаем системные сообщения (создание группы, добавление участников и т.д.)
+                if msg.action is not None:
+                    continue
+
                 text = msg.text or msg.message or ''
                 if hasattr(msg, 'caption') and msg.caption:
                     text = msg.caption
 
-                # Текст в одну строку без переносов и лишних пробелов
+                # Текст в одну строку
                 text = ' '.join(text.split())
 
-                author = get_author(msg)
+                author_name, author_link = get_author_info(msg)
                 link = build_link(chat, msg.id)
                 date = msg.date.replace(tzinfo=None)
                 new_last_link = link
 
                 # Фильтр ключевых слов только для постов с текстом
-                if keywords_enabled and keywords and text.strip():
-                    if not matches_keywords(text, keywords):
+                if keywords_enabled and keywords:
+                    if text.strip():
+                        if not matches_keywords(text, keywords):
+                            continue
+                    else:
+                        # Пост без текста — пропускаем если фильтр включён
                         continue
 
                 saved_msgs.append({
                     'date': date,
                     'chat_name': chat_name,
-                    'author': author,
+                    'author_name': author_name,
+                    'author_link': author_link,
                     'link': link,
                     'text': text
                 })
