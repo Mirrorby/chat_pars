@@ -182,45 +182,15 @@ def get_author_info(msg):
         return '', ''
 
 def matches_keywords(text, keywords):
-    """
-    Проверяет текст на соответствие ключевым словам.
-    Поддерживает поиск по корню слова автоматически.
-    Звёздочка в конце (купи*) — явный поиск по корню.
-    Без звёздочки — ищем точное слово И однокоренные формы.
-    """
     if not text or not keywords:
         return False
     text_lower = text.lower()
-
     for kw in keywords:
-        kw_lower = kw.lower().strip()
+        kw_lower = kw.lower().strip().rstrip('*')
         if not kw_lower:
             continue
-
-        # Режим явного корня: тест* → тест, тестируем, тестовый, тестирование...
-        if kw_lower.endswith('*'):
-            root = kw_lower[:-1]
-            # Ищем корень как начало слова
-            if re.search(r'\b' + re.escape(root), text_lower):
-                return True
-            continue
-
-        # Точное совпадение
-        escaped = re.escape(kw_lower)
-        if re.search(r'\b' + escaped + r'\b', text_lower):
+        if kw_lower in text_lower:
             return True
-
-        # Автоматический поиск однокоренных форм:
-        # Постепенно укорачиваем слово отрезая окончания (минимум 4 буквы в корне)
-        # тест → тест (корень) → найдёт тестируем, тестовый, тестирование
-        # привет → привет (корень) → найдёт приветствую, приветливый
-        for cut in range(1, min(4, len(kw_lower) - 3)):
-            root = kw_lower[:-cut]
-            if len(root) < 4:
-                break
-            if re.search(r'\b' + re.escape(root), text_lower):
-                return True
-
     return False
 
 async def main():
