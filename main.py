@@ -318,6 +318,8 @@ async def main():
 
     for ch in channels:
         chat_username = ch['username']
+        # Числовые peer_id передаём как int — иначе Telethon не резолвит приватные чаты
+        chat_peer = int(chat_username) if re.match(r'^-?\d+$', str(chat_username)) else chat_username
         last_link = ch['last_link']
         last_post_id = extract_post_id(last_link) if last_link else 0
         row = ch['row']
@@ -327,7 +329,7 @@ async def main():
             since = datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MINUTES)
             messages = []
 
-            async for msg in client.iter_messages(chat_username, limit=100):
+            async for msg in client.iter_messages(chat_peer, limit=100):
                 if last_post_id > 0:
                     if msg.id <= last_post_id:
                         break
