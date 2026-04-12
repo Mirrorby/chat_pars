@@ -2,33 +2,42 @@ name: TG Parser
 
 on:
   schedule:
-    - cron: '*/15 * * * *'   # каждые 5 минут
-  workflow_dispatch:          # ручной запуск через кнопку в интерфейсе
+    # каждые 15 минут — с учётом ~6 мин старта Actions реальная частота ~20-22 мин
+    - cron: '*/15 * * * *'
+  workflow_dispatch:  # ручной запуск
 
 jobs:
   parse:
     runs-on: ubuntu-latest
-    timeout-minutes: 20       # принудительно убивает если завис
+    timeout-minutes: 25   # убиваем если завис, не даём перекрыть следующий запуск
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Install deps
+        run: pip install telethon gspread google-auth
 
       - name: Run parser
         env:
-          TG_API_ID:                ${{ secrets.TG_API_ID }}
-          TG_API_HASH:              ${{ secrets.TG_API_HASH }}
-          TG_SESSION:               ${{ secrets.TG_SESSION }}
+          # Аккаунт 1 (свой API_ID/HASH на my.telegram.org)
+          TG_API_ID_1:   ${{ secrets.TG_API_ID_1 }}
+          TG_API_HASH_1: ${{ secrets.TG_API_HASH_1 }}
+          TG_SESSION_1:  ${{ secrets.TG_SESSION_1 }}
+          # Аккаунт 2
+          TG_API_ID_2:   ${{ secrets.TG_API_ID_2 }}
+          TG_API_HASH_2: ${{ secrets.TG_API_HASH_2 }}
+          TG_SESSION_2:  ${{ secrets.TG_SESSION_2 }}
+          # Аккаунт 3
+          TG_API_ID_3:   ${{ secrets.TG_API_ID_3 }}
+          TG_API_HASH_3: ${{ secrets.TG_API_HASH_3 }}
+          TG_SESSION_3:  ${{ secrets.TG_SESSION_3 }}
+          # Google Sheets
           GOOGLE_CREDENTIALS_BASE64: ${{ secrets.GOOGLE_CREDENTIALS_BASE64 }}
-          SPREADSHEET_IDS:          ${{ secrets.SPREADSHEET_IDS }}
-          MESSAGES_LIMIT:           '10'
-        run: python main.py
+          SPREADSHEET_IDS:           ${{ secrets.SPREADSHEET_IDS }}
+          MESSAGES_LIMIT: '10'
+        run: python parser.py
