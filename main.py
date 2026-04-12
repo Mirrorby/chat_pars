@@ -86,6 +86,23 @@ def _gs_open(ss_id):
     return gspread.authorize(creds).open_by_key(ss_id)
 
 
+def _gs_retry(fn, *args, retries=3, delay=10, **kwargs):
+    """Повторяет вызов fn при временных ошибках Sheets API (503, quota)."""
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            msg = str(e).lower()
+            # не повторяем при явных ошибках конфигурации
+            if any(x in msg for x in ('invalid', 'permission', 'not found', 'credentials')):
+                raise
+            log.warning(f'GS retry {attempt + 1}/{retries}: {e}')
+            time.sleep(delay * (attempt + 1))
+    raise last_exc
+
+
 def _gs_settings(ss, label):
     try:
         d = ss.worksheet('Настройки').get_all_values()
@@ -114,8 +131,8 @@ def _gs_channels(ss, label):
         return []
 
 
-def _gs_read_cache(ss, label):
-    """Читает лист Кеш → {username: entity_id}"""
+def _gs_read_cache_full(ss, label):
+    """Читает лист Кеш → {username: (entity_id, chat_name)}"""
     try:
         try:
             ws = ss.worksheet('Кеш')
@@ -127,7 +144,9 @@ def _gs_read_cache(ss, label):
         for r in ws.get_all_values()[1:]:
             if len(r) >= 2 and r[0].strip() and r[1].strip():
                 try:
-                    cache[r[0].strip()] = int(float(r[1].strip()))
+                    eid = int(float(r[1].strip()))
+                    name = r[2].strip() if len(r) > 2 else ''
+                    cache[r[0].strip()] = (eid, name)
                 except ValueError:
                     pass
         log.info(f'[{label}] entity cache: {len(cache)} entries')
@@ -219,12 +238,22 @@ def _gs_read_recent(ss, label):
         return set()
 
 
+LOGS_MAX_ROWS = 500  # максимум строк в листе Логи
+
+
 def _gs_log(ss, label, level, msg):
     try:
-        ss.worksheet('Логи').append_row(
+        ws = ss.worksheet('Логи')
+        ws.append_row(
             [datetime.now().strftime('%Y-%m-%d %H:%M:%S'), level, str(msg)],
             value_input_option='USER_ENTERED',
         )
+        # Ротация: если строк больше LOGS_MAX_ROWS — удаляем старые сверху
+        all_rows = ws.get_all_values()
+        if len(all_rows) > LOGS_MAX_ROWS + 1:  # +1 заголовок
+            excess = len(all_rows) - LOGS_MAX_ROWS - 1
+            # удаляем строки 2..excess+1 (сразу после заголовка)
+            ws.delete_rows(2, excess + 1)
     except Exception:
         pass
 
@@ -388,8 +417,15 @@ async def run_account(account: dict, acc_idx: int, channel_list: list,
         account['api_id'],
         account['api_hash'],
     )
+
+    def _no_input(prompt=''):
+        raise RuntimeError(f'[{label}] session expired or invalid — regenerate TG_SESSION_{acc_idx + 1}')
+
     try:
-        await client.start()
+        await client.start(phone=_no_input, password=_no_input)
+    except RuntimeError as e:
+        log.error(str(e))
+        return
     except Exception as e:
         log.error(f'[{label}] connect failed: {e}')
         return
@@ -483,8 +519,11 @@ async def run_account(account: dict, acc_idx: int, channel_list: list,
                 if m.photo:
                     try:
                         buf = io.BytesIO()
-                        await client.download_media(m, file=buf)
+                        await asyncio.wait_for(
+                            client.download_media(m, file=buf), timeout=30)
                         photos = [buf.getvalue()]
+                    except asyncio.TimeoutError:
+                        log.warning(f'[{label}] download_media timeout {uname}/{m.id}')
                     except Exception:
                         pass
 
@@ -529,8 +568,11 @@ async def run_account(account: dict, acc_idx: int, channel_list: list,
                     if m.photo or m.document:
                         try:
                             buf = io.BytesIO()
-                            await client.download_media(m, file=buf)
+                            await asyncio.wait_for(
+                                client.download_media(m, file=buf), timeout=30)
                             photos.append(buf.getvalue())
+                        except asyncio.TimeoutError:
+                            log.warning(f'[{label}] download_media timeout {uname}/{m.id}')
                         except Exception:
                             pass
 
@@ -553,11 +595,13 @@ async def run_account(account: dict, acc_idx: int, channel_list: list,
             processed += 1
 
             # ── периодическое сохранение state ────────────────────────────
+            # Каждый аккаунт пишет только те таблицы, каналы которых он обработал,
+            # чтобы не затирать записи другого аккаунта на том же листе.
             if processed % STATE_SAVE_INTERVAL == 0:
-                for i, ss_ in enumerate(ss_list):
-                    lbl_ = f'SS{i + 1}'
+                my_ss_idxs = {si for _, si in channel_list}
+                for si in my_ss_idxs:
                     await loop.run_in_executor(
-                        pool, _gs_write_state, ss_, lbl_, state_list[i])
+                        pool, _gs_write_state, ss_list[si], f'SS{si + 1}', state_list[si])
                 log.info(f'[{label}] periodic state save at {processed} channels')
 
             await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
@@ -587,21 +631,22 @@ async def main():
     for i, ss_id in enumerate(SS_IDS):
         lbl = f'SS{i + 1}'
         try:
-            ss = await loop.run_in_executor(pool, _gs_open, ss_id)
+            ss = await loop.run_in_executor(pool, _gs_retry, _gs_open, ss_id)
         except Exception as e:
             log.error(f'[{lbl}] open failed: {e}')
             continue
 
-        cfg = await loop.run_in_executor(pool, _gs_settings, ss, lbl)
+        cfg = await loop.run_in_executor(pool, _gs_retry, _gs_settings, ss, lbl)
         if not cfg:
             continue
 
-        state = await loop.run_in_executor(pool, _gs_read_state, ss, lbl)
-        cache = await loop.run_in_executor(pool, _gs_read_cache, ss, lbl)
-        # cache: {uname: entity_id} → конвертируем в {uname: (entity_id, '')}
-        cache = {u: (eid, '') for u, eid in cache.items()}
-        dedup = await loop.run_in_executor(pool, _gs_read_recent, ss, lbl)
-        raws  = await loop.run_in_executor(pool, _gs_channels, ss, lbl)
+        state = await loop.run_in_executor(pool, _gs_retry, _gs_read_state, ss, lbl)
+        # cache: {uname: entity_id} → конвертируем в {uname: (entity_id, chat_name)}
+        # chat_name берём из колонки C если она есть — для этого читаем raw строки
+        cache_raw = await loop.run_in_executor(pool, _gs_retry, _gs_read_cache_full, ss, lbl)
+        cache = cache_raw  # уже {uname: (entity_id, chat_name)}
+        dedup = await loop.run_in_executor(pool, _gs_retry, _gs_read_recent, ss, lbl)
+        raws  = await loop.run_in_executor(pool, _gs_retry, _gs_channels, ss, lbl)
 
         si = len(ss_list)
         ss_list.append(ss)
