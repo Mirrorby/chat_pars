@@ -62,8 +62,11 @@ SPREADSHEET_IDS        = [
     s.strip() for s in os.environ.get('SPREADSHEET_IDS', '').split(',') if s.strip()
 ]
 
-# Пауза между get_messages запросами — защита от FloodWait
-REQUEST_DELAY = 1.5  # секунд
+# Пауза между каналами
+REQUEST_DELAY = 2.0  # секунд
+
+# Максимальное время ожидания FloodWait — если больше, пропускаем канал
+MAX_FLOOD_WAIT = 300  # секунд (5 минут)
 
 # ── Логирование ────────────────────────────────────────────────────────────────
 
@@ -325,6 +328,14 @@ def _build_link(chat, msg_id: int) -> str:
     return f'https://t.me/c/{chat_id}/{msg_id}'
 
 
+def _build_link_from_cache(username: str, entity_id: int, msg_id: int) -> str:
+    """Строит ссылку без get_entity — из кешированных данных."""
+    # Если username числовой (приватный чат), используем /c/ формат
+    if re.match(r'^-100\d+$', username) or re.match(r'^\d+$', username):
+        return f'https://t.me/c/{entity_id}/{msg_id}'
+    return f'https://t.me/{username}/{msg_id}'
+
+
 def _get_author_info(msg):
     try:
         sender = msg.sender
@@ -439,6 +450,38 @@ def _send_media_group_sync(caption: str, tg_token: str, chats: list, photos: lis
             _send_telegram_sync(caption, tg_token, [chat_id])
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Безопасный вызов Telegram API с обработкой FloodWait
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _safe_tg_call(coro_func, *args, label='', max_retries=3, **kwargs):
+    """
+    Выполняет async-вызов Telegram API с обработкой FloodWait.
+    Если FloodWait > MAX_FLOOD_WAIT секунд — пропускает (возвращает None).
+    """
+    for attempt in range(max_retries):
+        try:
+            return await coro_func(*args, **kwargs)
+        except FloodWaitError as e:
+            wait = e.seconds + 5
+            if wait > MAX_FLOOD_WAIT:
+                log.warning(
+                    f'[{label}] FloodWait {wait}s > MAX_FLOOD_WAIT={MAX_FLOOD_WAIT}s — пропускаю'
+                )
+                return None
+            log.warning(f'[{label}] FloodWait {wait}s (попытка {attempt + 1}/{max_retries}) — жду...')
+            await asyncio.sleep(wait)
+        except (ChannelPrivateError, UsernameNotOccupiedError, UsernameInvalidError) as e:
+            log.warning(f'[{label}] Канал недоступен: {e}')
+            return None
+        except Exception as e:
+            log.error(f'[{label}] Ошибка TG вызова (попытка {attempt + 1}/{max_retries}): {e}')
+            if attempt < max_retries - 1:
+                await asyncio.sleep(5)
+            else:
+                return None
+    return None
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Резолв каналов
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -449,36 +492,42 @@ async def _resolve_channel(
     label: str,
     entity_cache: dict,
 ) -> tuple[int, str, object] | None:
-    """Возвращает (abs_entity_id, chat_name, peer) или None."""
+    """
+    Возвращает (abs_entity_id, chat_name, entity_object) или None.
+    Использует кеш — НЕ делает запрос к TG если данные уже есть.
+    """
     loop = asyncio.get_event_loop()
 
-    # Из кеша
+    # Из кеша — без запроса к TG
     if username in entity_cache:
-        ec   = entity_cache[username]
-        peer = int(username) if re.match(r'^-100\d+$', username) else username
+        ec = entity_cache[username]
+        # Для числового ID передаём int, иначе строку
+        if re.match(r'^-100\d+$', username):
+            peer = int(username)
+        else:
+            peer = username
         return ec['entity_id'], ec['chat_name'], peer
 
-    # Через Telegram API
-    try:
-        peer   = int(username) if re.match(r'^-100\d+$', username) else username
-        entity = await client.get_entity(peer)
-        eid    = abs(entity.id)
-        name   = getattr(entity, 'title', None) or username
-        entity_cache[username] = {'entity_id': eid, 'chat_name': name}
-        await loop.run_in_executor(_executor, _write_entity_cache, ss, username, eid, name)
-        log.info(f'[{label}] Резолв: {username} -> {eid} ({name})')
-        await asyncio.sleep(2.0)
-        return eid, name, peer
-    except FloodWaitError as e:
-        log.warning(f'[{label}] FloodWait при резолве {username}: жду {e.seconds}s')
-        await asyncio.sleep(e.seconds + 2)
+    # Нет в кеше — резолвим через Telegram API
+    log.info(f'[{label}] Резолв нового канала: {username}')
+    if re.match(r'^-100\d+$', username):
+        peer = int(username)
+    else:
+        peer = username
+
+    entity = await _safe_tg_call(client.get_entity, peer, label=label)
+    if entity is None:
         return None
-    except (ChannelPrivateError, UsernameNotOccupiedError, UsernameInvalidError) as e:
-        log.warning(f'[{label}] Недоступен {username}: {e}')
-        return None
-    except Exception as e:
-        log.error(f'[{label}] Ошибка резолва {username}: {e}')
-        return None
+
+    eid  = abs(entity.id)
+    name = getattr(entity, 'title', None) or username
+    entity_cache[username] = {'entity_id': eid, 'chat_name': name}
+    await loop.run_in_executor(_executor, _write_entity_cache, ss, username, eid, name)
+    log.info(f'[{label}] Резолв OK: {username} -> {eid} ({name})')
+
+    # Пауза только после реального запроса к TG
+    await asyncio.sleep(2.0)
+    return eid, name, peer
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Обход одной таблицы
@@ -523,20 +572,11 @@ async def _process_spreadsheet(client: TelegramClient, spreadsheet_id: str, inde
         eid, chat_name, peer = resolved
         known_last = channel_state.get(username, 0)
 
-        # Получаем сообщения
-        try:
-            messages = await client.get_messages(peer, limit=MESSAGES_LIMIT)
-        except FloodWaitError as e:
-            log.warning(f'[{label}] FloodWait {username}: жду {e.seconds}s')
-            await asyncio.sleep(e.seconds + 2)
-            try:
-                messages = await client.get_messages(peer, limit=MESSAGES_LIMIT)
-            except Exception as e2:
-                log.error(f'[{label}] Повторная ошибка {username}: {e2}')
-                await asyncio.sleep(REQUEST_DELAY)
-                continue
-        except Exception as e:
-            log.error(f'[{label}] Ошибка get_messages {username}: {e}')
+        # Получаем сообщения — через безопасный враппер
+        messages = await _safe_tg_call(
+            client.get_messages, peer, limit=MESSAGES_LIMIT, label=label
+        )
+        if messages is None:
             await asyncio.sleep(REQUEST_DELAY)
             continue
 
@@ -596,11 +636,8 @@ async def _process_spreadsheet(client: TelegramClient, spreadsheet_id: str, inde
                 except Exception as e:
                     log.warning(f'[{label}] Не удалось скачать фото {msg.id}: {e}')
 
-            try:
-                chat = await client.get_entity(peer)
-                link = _build_link(chat, msg.id)
-            except Exception:
-                link = ''
+            # Строим ссылку из кеша — БЕЗ get_entity
+            link = _build_link_from_cache(username, eid, msg.id)
 
             author_name, author_link = _get_author_info(msg)
 
@@ -668,11 +705,8 @@ async def _process_spreadsheet(client: TelegramClient, spreadsheet_id: str, inde
                     except Exception as e:
                         log.warning(f'[{label}] Не удалось скачать медиа {m.id}: {e}')
 
-            try:
-                chat = await client.get_entity(peer)
-                link = _build_link(chat, first_msg.id)
-            except Exception:
-                link = ''
+            # Строим ссылку из кеша — БЕЗ get_entity
+            link = _build_link_from_cache(username, eid, first_msg.id)
 
             author_name, author_link = _get_author_info(first_msg)
 
@@ -744,6 +778,10 @@ async def main():
     try:
         for i, ss_id in enumerate(SPREADSHEET_IDS):
             await _process_spreadsheet(client, ss_id, i)
+            # Пауза между таблицами чтобы не накапливать флуд
+            if i < len(SPREADSHEET_IDS) - 1:
+                log.info('Пауза 10s между таблицами...')
+                await asyncio.sleep(10)
     finally:
         await client.disconnect()
         log.info('Telegram: отключён')
