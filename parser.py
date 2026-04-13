@@ -208,10 +208,10 @@ def _gs_write_state(ss, label, state):
         log.error(f'[{label}] write_state: {e}')
 
 
-def _gs_write_post(ss, date, channel, link, text):
+def _gs_write_post(ss, date, channel, author, account, link, text):
     try:
         ss.worksheet('Посты').append_row(
-            [date.strftime('%Y-%m-%d %H:%M:%S'), channel, '', '', '', link, text],
+            [date.strftime('%Y-%m-%d %H:%M:%S'), channel, author, account, link, text],
             value_input_option='USER_ENTERED',
         )
     except Exception as e:
@@ -298,6 +298,20 @@ def _make_link(uname, entity_id, msg_id):
     if re.match(r'^-?100\d+$', str(uname)):
         return f'https://t.me/c/{entity_id}/{msg_id}'
     return f'https://t.me/{uname}/{msg_id}'
+
+
+def _get_sender(m):
+    """Возвращает (author_name, account_link) из сообщения."""
+    sender = getattr(m, 'sender', None) or getattr(m, 'from_id', None)
+    if sender is None:
+        return '', ''
+    # имя
+    first = getattr(sender, 'first_name', '') or ''
+    last  = getattr(sender, 'last_name',  '') or ''
+    uname = getattr(sender, 'username',   '') or ''
+    author  = (first + ' ' + last).strip() or uname or ''
+    account = f'https://t.me/{uname}' if uname else ''
+    return author, account
 
 
 # ── telegram send ──────────────────────────────────────────────────────────────
@@ -513,6 +527,7 @@ async def run_account(account: dict, acc_idx: int, channel_list: list,
                     continue
 
                 link = _make_link(uname, eid, m.id)
+                author, account = _get_sender(m)
                 body = f'📢 {uname}\n\n{text}\n\n🔗 {link}'
 
                 photos = []
@@ -537,7 +552,7 @@ async def run_account(account: dict, acc_idx: int, channel_list: list,
 
                 await loop.run_in_executor(
                     pool, _gs_write_post, ss,
-                    m.date.replace(tzinfo=None), uname, link, text)
+                    m.date.replace(tzinfo=None), uname, author, account, link, text)
                 dedup.add(norm)
                 log.info(f'[{label}] sent {uname} {link}')
 
@@ -561,6 +576,7 @@ async def run_account(account: dict, acc_idx: int, channel_list: list,
                     continue
 
                 link = _make_link(uname, eid, msgs[0].id)
+                author, account = _get_sender(msgs[0])
                 body = f'📢 {uname}\n\n{text}\n\n🔗 {link}'
 
                 photos = []
@@ -587,7 +603,7 @@ async def run_account(account: dict, acc_idx: int, channel_list: list,
                 post_text = text + (f' [photo:{len(photos)}]' if photos else '')
                 await loop.run_in_executor(
                     pool, _gs_write_post, ss,
-                    msgs[0].date.replace(tzinfo=None), uname, link, post_text)
+                    msgs[0].date.replace(tzinfo=None), uname, author, account, link, post_text)
                 dedup.add(norm)
                 log.info(f'[{label}] sent {uname} album({len(photos)}) {link}')
 
