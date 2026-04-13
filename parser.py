@@ -316,6 +316,23 @@ def _get_sender(m):
 
 # ── telegram send ──────────────────────────────────────────────────────────────
 
+def _bot_request(req, timeout, label):
+    """Выполняет запрос к Bot API с retry при 429."""
+    for attempt in range(5):
+        try:
+            urllib.request.urlopen(req, timeout=timeout)
+            return True
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                retry_after = int(e.headers.get('Retry-After', 15))
+                log.warning(f'[{label}] Bot API 429 — waiting {retry_after}s')
+                time.sleep(retry_after + 1)
+            else:
+                raise
+    log.error(f'[{label}] Bot API failed after 5 attempts')
+    return False
+
+
 def _tg_text(token, chats, text):
     for chat in chats:
         try:
@@ -327,7 +344,7 @@ def _tg_text(token, chats, text):
             req = urllib.request.Request(
                 f'https://api.telegram.org/bot{token}/sendMessage', data=data,
                 headers={'Content-Type': 'application/json'})
-            urllib.request.urlopen(req, timeout=10)
+            _bot_request(req, timeout=10, label=f'tg_text {chat}')
             time.sleep(0.3)
         except Exception as e:
             log.error(f'tg_text {chat}: {e}')
@@ -348,7 +365,8 @@ def _tg_photo(token, chats, caption, photo: bytes):
             req = urllib.request.Request(
                 f'https://api.telegram.org/bot{token}/sendPhoto', data=body,
                 headers={'Content-Type': f'multipart/form-data; boundary={boundary}'})
-            urllib.request.urlopen(req, timeout=30)
+            if not _bot_request(req, timeout=30, label=f'tg_photo {chat}'):
+                _tg_text(token, [chat], caption)
             time.sleep(0.3)
         except Exception as e:
             log.error(f'tg_photo {chat}: {e}')
@@ -384,7 +402,8 @@ def _tg_album(token, chats, caption, photos: list):
             req = urllib.request.Request(
                 f'https://api.telegram.org/bot{token}/sendMediaGroup', data=body,
                 headers={'Content-Type': f'multipart/form-data; boundary={boundary}'})
-            urllib.request.urlopen(req, timeout=30)
+            if not _bot_request(req, timeout=30, label=f'tg_album {chat}'):
+                _tg_text(token, [chat], caption)
             time.sleep(0.3)
         except Exception as e:
             log.error(f'tg_album {chat}: {e}')
@@ -528,7 +547,9 @@ async def run_account(account: dict, acc_idx: int, channel_list: list,
 
                 link = _make_link(uname, eid, m.id)
                 author, account = _get_sender(m)
-                body = f'📢 {uname}\n\n{text}\n\n🔗 {link}'
+                author_line = f'👤 {author}  {account}'.strip() if author or account else ''
+                body = (f'📢 {uname}\n{author_line}\n\n{text}\n\n🔗 {link}'
+                        if author_line else f'📢 {uname}\n\n{text}\n\n🔗 {link}')
 
                 photos = []
                 if m.photo:
@@ -577,7 +598,9 @@ async def run_account(account: dict, acc_idx: int, channel_list: list,
 
                 link = _make_link(uname, eid, msgs[0].id)
                 author, account = _get_sender(msgs[0])
-                body = f'📢 {uname}\n\n{text}\n\n🔗 {link}'
+                author_line = f'👤 {author}  {account}'.strip() if author or account else ''
+                body = (f'📢 {uname}\n{author_line}\n\n{text}\n\n🔗 {link}'
+                        if author_line else f'📢 {uname}\n\n{text}\n\n🔗 {link}')
 
                 photos = []
                 for m in msgs:
