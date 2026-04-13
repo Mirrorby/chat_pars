@@ -1,9 +1,6 @@
 name: TG Parser
 
 on:
-  schedule:
-    # каждые 15 минут — с учётом ~6 мин старта Actions реальная частота ~20-22 мин
-    - cron: '*/30 * * * *'
   workflow_dispatch:  # ручной запуск
 
 jobs:
